@@ -1,11 +1,8 @@
 {-# LANGUAGE DeriveGeneric #-}
 module Graphics.SVGFonts.ReadFont
-       (
-         FontData(..)
-
-       , bbox_dy
+       ( bbox_dy
        , bbox_lx, bbox_ly
-
+       , getGlyphPath
        , underlinePosition
        , underlineThickness
 
@@ -13,29 +10,29 @@ module Graphics.SVGFonts.ReadFont
        , kernAdvance
        , Kern(..)
 
-       , OutlineMap
-       , PreparedFont
+       , PreparedFont(..)
        , loadFont
-       , loadFont'
+       , validateFont
        ) where
 
+import qualified Data.ByteString.Char8 as BS
+import qualified Data.ByteString.Lazy as BSL
 import           Data.Char                       (isSpace)
-import           Data.List                       (intersect, sortBy)
+import           Data.List                       (intersect, sortBy, lookup)
 import           Data.List.Split                 (splitOn, splitWhen)
 import qualified Data.Map                        as Map
-import           Data.Maybe                      (catMaybes, fromJust,
-                                                  fromMaybe, isJust, isNothing,
-                                                  maybeToList)
+import           Data.Maybe                      (fromJust, fromMaybe, isNothing,
+                                                  maybeToList, maybe, mapMaybe)
 import           Data.Tuple.Select
 import qualified Data.Vector                     as V
 import           Diagrams.Path
 import           Diagrams.Prelude                hiding (font)
-import           Text.XML.Light
-import           Text.XML.Light.Lexer (XmlSource)
+import           Text.XML.Expat.Proc
+import           Text.XML.Expat.Tree
 
 import           Graphics.SVGFonts.CharReference (charsFromFullName)
 import           Graphics.SVGFonts.ReadPath      (PathCommand (..),
-                                                  pathFromString)
+                                                  pathFromByteString)
 
 import           GHC.Generics                    (Generic)
 import           Data.Serialize                  (Serialize)
@@ -43,7 +40,7 @@ import           Data.Vector.Serialize           ()
 
 -- | This type contains everything that a typical SVG font file produced
 --   by fontforge contains.
-data FontData n = FontData
+data PreparedFont n = PreparedFont
   { fontDataGlyphs                 :: SvgGlyphs n
   , fontDataKerning                :: Kern n
   , fontDataBoundingBox            :: [n]
@@ -86,18 +83,19 @@ data FontData n = FontData
   , fontDataVHangingBaseline       :: Maybe n
   } deriving (Generic)
 
-instance Serialize n => Serialize (FontData n)
-
 -- | Open an SVG-Font File and extract the data
-parseFont :: (XmlSource s, Read n, RealFloat n) => FilePath -> s -> FontData n
+parseFont :: (Read n, RealFloat n) => FilePath -> BSL.ByteString -> PreparedFont n
 parseFont basename contents = readFontData fontElement basename
   where
-    xml = onlyElems $ parseXML $ contents
-    fontElement = head $ catMaybes $ map (findElement (unqual "font")) xml
+    xml :: UNode String
+    (xml, Nothing) = parse defaultParseOptions contents
+
+    fontElement :: UNode String
+    Just fontElement = findElement "font" xml
 
 -- | Read font data from an XML font element.
-readFontData :: (Read n, RealFloat n) => Element -> String -> FontData n
-readFontData fontElement basename = FontData
+readFontData :: (Read n, RealFloat n) => UNode String -> String -> PreparedFont n
+readFontData fontElement basename = PreparedFont
   { fontDataGlyphs      = Map.fromList glyphs
   , fontDataKerning     = Kern
     { kernU1S = transformChars u1s
@@ -144,55 +142,69 @@ readFontData fontElement basename = FontData
   , fontDataStrikethroughThickness = fontface `readAttrM` "strikethrough-thickness"
   }
   where
-    readAttr :: (Read a) => Element -> String -> a
-    readAttr e attr = fromJust $ fmap read $ findAttr (unqual attr) e
+    findAttr :: String -> UNode String -> Maybe String
+    findAttr k = lookup k . getAttributes
 
-    readAttrM :: (Read a) => Element -> String -> Maybe a
-    readAttrM e attr = fmap read $ findAttr (unqual attr) e
+    readAttr :: (Read a) => UNode String -> String -> a
+    readAttr e attr = fromJust $ fmap read $ findAttr attr e
+
+    readAttrM :: (Read a) => UNode String -> String -> Maybe a
+    readAttrM e attr = fmap read $ findAttr attr e
 
     -- | @readString e a d@ : @e@ element to read from; @a@ attribute to read; @d@ default value.
-    readString :: Element -> String -> String -> String
-    readString e attr d = fromMaybe d $ findAttr (unqual attr) e
+    readString :: UNode String -> String -> String -> String
+    readString e attr d = fromMaybe d $ findAttr attr e
 
-    readStringM :: Element -> String -> Maybe String
-    readStringM e attr = findAttr (unqual attr) e
+    readStringM :: UNode String -> String -> Maybe String
+    readStringM e attr = findAttr attr e
 
     fontHadv = fromMaybe ((parsedBBox!!2) - (parsedBBox!!0)) -- BBox is used if there is no "horiz-adv-x" attribute
-                         (fmap read (findAttr (unqual "horiz-adv-x") fontElement) )
-    fontface = fromJust $ findElement (unqual "font-face") fontElement -- there is always a font-face node
+                         (fmap read (findAttr "horiz-adv-x" fontElement) )
+    fontface = fromJust $ findElement "font-face" fontElement -- there is always a font-face node
     bbox     = readString fontface "bbox" ""
     parsedBBox :: Read n => [n]
     parsedBBox = map read $ splitWhen isSpace bbox
 
-    glyphElements = findChildren (unqual "glyph") fontElement
-    kernings = findChildren (unqual "hkern") fontElement
+    glyphElements = findChildren "glyph" fontElement
+    kernings = findChildren "hkern" fontElement
 
     glyphs = map glyphsWithDefaults glyphElements
 
     -- monospaced fonts sometimes don't have a "horiz-adv-x="-value , replace with "horiz-adv-x=" in <font>
-    glyphsWithDefaults g = (charsFromFullName $ fromMaybe gname (findAttr (unqual "unicode") g), -- there is always a name or unicode
-                             (
-                               gname,
-                               fromMaybe fontHadv (fmap read (findAttr (unqual "horiz-adv-x") g)),
-                               fromMaybe "" (findAttr (unqual "d") g)
+    glyphsWithDefaults g = (charsFromFullName $ fromMaybe gname (findAttr "unicode" g), -- there is always a name or unicode
+                             ( gname
+                             , fromMaybe fontHadv (fmap read (findAttr "horiz-adv-x" g))
+                             , d_val
+                             -- Inline outline map in the PreparedFont:
+                             -- this way if a glyph is used once, it
+                             -- can be re-used without the (high) cost
+                             -- of reparsing and recalculating it. The
+                             -- saving grace is laziness.
+                             , (\cmds -> mconcat $ commandsToTrails cmds [] zero zero zero)
+                               <$> pathFromByteString (BS.pack d_val)
                              )
                            )
-      where gname = fromMaybe "" (findAttr (unqual "glyph-name") g)
 
-    u1s         = map (fromMaybe "") $ map (findAttr (unqual "u1"))  kernings
-    u2s         = map (fromMaybe "") $ map (findAttr (unqual "u2"))  kernings
-    g1s         = map (fromMaybe "") $ map (findAttr (unqual "g1"))  kernings
-    g2s         = map (fromMaybe "") $ map (findAttr (unqual "g2"))  kernings
-    ks          = map (fromMaybe "") $ map (findAttr (unqual "k"))   kernings
+      where gname = fromMaybe "" (findAttr "glyph-name" g)
+            d_val = fromMaybe mempty $! findAttr "d" g
+
+
+--        return $
+
+    u1s         = map (fromMaybe "") $ map (findAttr "u1")  kernings
+    u2s         = map (fromMaybe "") $ map (findAttr "u2")  kernings
+    g1s         = map (fromMaybe "") $ map (findAttr "g1")  kernings
+    g2s         = map (fromMaybe "") $ map (findAttr "g2")  kernings
+    ks          = map (fromMaybe "") $ map (findAttr "k")   kernings
     kAr     = V.fromList (map read ks)
 
     rawKerns = fmap getRawKern kernings
     getRawKern kerning =
-      let u1 = splitWhen (==',') $ fromMaybe "" $ findAttr (unqual "u1") $ kerning
-          u2 = splitWhen (==',') $ fromMaybe "" $ findAttr (unqual "u2") $ kerning
-          g1 = splitWhen (==',') $ fromMaybe "" $ findAttr (unqual "g1") $ kerning
-          g2 = splitWhen (==',') $ fromMaybe "" $ findAttr (unqual "g2") $ kerning
-          k  = fromMaybe "" $ findAttr (unqual "k") $ kerning
+      let u1 = splitWhen (==',') $ fromMaybe "" $ findAttr "u1" $ kerning
+          u2 = splitWhen (==',') $ fromMaybe "" $ findAttr "u2" $ kerning
+          g1 = splitWhen (==',') $ fromMaybe "" $ findAttr "g1" $ kerning
+          g2 = splitWhen (==',') $ fromMaybe "" $ findAttr "g2" $ kerning
+          k  = fromMaybe "" $ findAttr "k" $ kerning
       in (k, g1, g2, u1, u2)
 
     transformChars chars = Map.fromList $ map ch $ multiSet $
@@ -213,14 +225,13 @@ readFontData fontElement basename = FontData
 
 
 
-type SvgGlyphs n = Map.Map String (String, n, String)
--- ^ \[ (unicode, (glyph_name, horiz_advance, ds)) \]
+-- | \[ (unicode, (glyph_name, horiz_advance, ds, glyph_outline)) \]
+type SvgGlyphs n = Map.Map String (String, n, String, Either String (Path V2 n))
+
 
 -- | Horizontal advance of a character consisting of its width and spacing, extracted out of the font data
-horizontalAdvance :: String -> FontData n -> n
-horizontalAdvance ch fontD
-    | isJust char = sel2 (fromJust char)
-    | otherwise   = fontDataHorizontalAdvance fontD
+horizontalAdvance :: String -> PreparedFont n -> n
+horizontalAdvance ch fontD = maybe (fontDataHorizontalAdvance fontD) sel2 char
   where char = (Map.lookup ch (fontDataGlyphs fontD))
 
 -- | See <http://www.w3.org/TR/SVG/fonts.html#KernElements>
@@ -285,73 +296,56 @@ kernAdvance ch0 ch1 kern u |     u && not (null s0) = (kernK kern) V.! (head s0)
 
 
 -- | Difference between highest and lowest y-value of bounding box
-bbox_dy :: RealFloat n => FontData n -> n
+bbox_dy :: RealFloat n => PreparedFont n -> n
 bbox_dy fontData = (bbox!!3) - (bbox!!1)
   where bbox = fontDataBoundingBox fontData -- bbox = [lowest x, lowest y, highest x, highest y]
 
 -- | Lowest x-value of bounding box
-bbox_lx :: FontData n -> n
+bbox_lx :: PreparedFont n -> n
 bbox_lx fontData   = (fontDataBoundingBox fontData) !! 0
 
 -- | Lowest y-value of bounding box
-bbox_ly :: FontData n -> n
+bbox_ly :: PreparedFont n -> n
 bbox_ly fontData   = (fontDataBoundingBox fontData) !! 1
 
 -- | Position of the underline bar
-underlinePosition :: FontData n -> n
+underlinePosition :: PreparedFont n -> n
 underlinePosition fontData = fontDataUnderlinePos fontData
 
 -- | Thickness of the underline bar
-underlineThickness :: FontData n -> n
+underlineThickness :: PreparedFont n -> n
 underlineThickness fontData = fontDataUnderlineThickness fontData
 
--- | A map of unicode characters to outline paths.
-type OutlineMap n = Map.Map String (Path V2 n)
-
--- | A map of unicode characters to parsing errors.
-type ErrorMap = Map.Map String String
-
--- | A font including its outline map.
-type PreparedFont n = (FontData n, OutlineMap n)
-
--- | Compute a font's outline map, collecting errors in a second map.
-outlineMap :: RealFloat n => FontData n -> (OutlineMap n, ErrorMap)
-outlineMap fontData =
-    ( Map.fromList [(ch, outl) | (ch, Right outl) <- allOutlines]
-    , Map.fromList [(ch, err)  | (ch, Left err)   <- allOutlines]
-    )
-  where
-    allUnicodes = Map.keys (fontDataGlyphs fontData)
-    outlines ch = do
-        cmds <- commands ch (fontDataGlyphs fontData)
-        return $ mconcat $ commandsToTrails cmds [] zero zero zero
-    allOutlines = [(ch, outlines ch) | ch <- allUnicodes]
-
--- | Prepare font for rendering, by determining its outline map.
-prepareFont :: RealFloat n => FontData n -> (PreparedFont n, ErrorMap)
-prepareFont fontData = ((fontData, outlines), errs)
-  where
-    (outlines, errs) = outlineMap fontData
-
--- | Read font data from font file, and compute its outline map.
+-- | Read font data from font file.
 loadFont :: (Read n, RealFloat n) => FilePath -> IO (PreparedFont n)
 loadFont filename = do
-  s <- readFile filename
-  let
-    basename = last $ init $ concat (map (splitOn "/") (splitOn "." filename))
-    (errors, font) = loadFont' basename s
-  putStrLn errors
-  return font
+  s <- BSL.readFile filename
+  let basename = last $ init $ concat (map (splitOn "/") (splitOn "." filename))
+  return $! parseFont basename s
 
--- | Read font data from an XmlSource, and compute its outline map.
-loadFont' :: (XmlSource s, Read n, RealFloat n) => String -> s -> (String, PreparedFont n)
-loadFont' basename s =
-  let
-    fontData = parseFont basename s
-    (font, errs) = prepareFont fontData
-    errors = unlines $ map (\(ch, err) -> "error parsing character '" ++ ch ++ "': " ++ err) (Map.toList errs)
-  in
-    (errors, font)
+-- | Parse every glyph in a font and find any errors, if any.
+--
+-- @[(glyph, errorMessage)]@
+validateFont :: PreparedFont n -> [(String, String)]
+validateFont = mapMaybe f . Map.toList . fontDataGlyphs
+  where
+    -- This should be OK and should not force outline computation!
+    -- We're only forcing the Either constructor and we don't inspect
+    -- the content of the outline, i.e. we're forcing the parsing
+    -- only.
+    f (ch, (_, _, ds, Left s)) = Just (ch, s)
+    f _ = Nothing
+
+-- | Extract (and potentially first calculate) the 'Path' for the
+-- specified glyph.
+--
+-- Nothing: no glyph in font or error during parsing
+getGlyphPath :: PreparedFont n
+             -> String -- ^ Glaph
+             -> Maybe (Path V2 n)
+getGlyphPath fd k = Map.lookup k (fontDataGlyphs fd) >>= \r -> case r of
+  (_, _, _, Right p) -> Just p
+  _ -> Nothing
 
 commandsToTrails ::RealFloat n => [PathCommand n] -> [Segment Closed V2 n] -> V2 n -> V2 n -> V2 n -> [Path V2 n]
 commandsToTrails [] _ _ _ _ = []
@@ -361,9 +355,7 @@ commandsToTrails (c:cs) segments l lastContr beginPoint -- l is the endpoint of 
       | otherwise = commandsToTrails cs (segments ++ [fromJust nextSegment])
                                            (l ^+^ offs) (contr c) (beginP c)   -- work on outline
   where nextSegment = go c
-        offs | isJust nextSegment
-               = segOffset (fromJust nextSegment)
-             | otherwise = zero
+        offs = maybe zero segOffset nextSegment
         (x0,y0) = unr2 offs
         (cx,cy) = unr2 lastContr -- last control point is always in absolute coordinates
         beginP ( M_abs (x,y) ) = r2 (x,y)
@@ -411,8 +403,3 @@ commandsToTrails (c:cs) segments l lastContr beginPoint -- l is the endpoint of 
         go ( Z ) = Nothing
         go ( A_abs ) = Nothing
         go ( A_rel ) = Nothing
-
-commands :: RealFloat n => String -> SvgGlyphs n -> Either String [PathCommand n]
-commands ch glyph = case Map.lookup ch glyph of
-    Just e -> pathFromString (sel3 e)
-    Nothing      -> Right []

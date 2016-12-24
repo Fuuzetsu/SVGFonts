@@ -70,8 +70,8 @@ textSVG' topts text =
                             mconcat $
                             zipWith translate (horPos space)
                            (map polygonChar (zip str (adjusted_hs space))) ) # centerXY
-    (fontD,outl) = textFont topts
-    polygonChar (ch,a) = (fromMaybe mempty (Map.lookup ch outl)) <> (underlineChar a)
+    fontD = textFont topts
+    polygonChar (ch,a) = (fromMaybe mempty (getGlyphPath fontD ch)) <> underlineChar a
     underlineChar a | underline topts = translateY ulinePos (rect a ulineThickness)
                     | otherwise = mempty
     ulinePos = underlinePosition fontD
@@ -117,8 +117,8 @@ textSVG_ topts text =
                             zipWith translate (horPos space)
                             (map polygonChar (zip str (adjusted_hs space))) ) # stroke # withEnvelope ((rect (w*space) h) :: D V2 n)
                           ) # alignBL # translateY (bbox_ly fontD*h/maxY)
-    (fontD,outl) = (textFont topts)
-    polygonChar (ch,a) = (fromMaybe mempty (Map.lookup ch outl)) <> (underlineChar a)
+    fontD = textFont topts
+    polygonChar (ch,a) = (fromMaybe mempty (getGlyphPath fontD ch)) <> underlineChar a
     underlineChar a | underline topts = translateX (a/2) $ translateY ulinePos (rect a ulineThickness)
                     | otherwise = mempty
     ulinePos = underlinePosition fontD
@@ -171,7 +171,7 @@ isKern _    = False
 
 -- | Horizontal advances of characters inside a string.
 -- A character is stored with a string (because of ligatures like \"ffi\").
-horizontalAdvances :: RealFloat n => [String] -> FontData n -> Bool -> [n]
+horizontalAdvances :: RealFloat n => [String] -> PreparedFont n -> Bool -> [n]
 horizontalAdvances []          _  _       = []
 horizontalAdvances [ch]        fd _       = [horizontalAdvance ch fd]
 horizontalAdvances (ch0:ch1:s) fd kerning = ((horizontalAdvance ch0 fd) - (ka (fontDataKerning fd))) :

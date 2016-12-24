@@ -75,7 +75,7 @@ Library
         text,
         tuple,
         vector,
-        xml
+        hexpat
     exposed-modules:
         Graphics.SVGFonts
         Graphics.SVGFonts.Text

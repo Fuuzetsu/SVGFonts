@@ -1,4 +1,4 @@
-module Graphics.SVGFonts.WriteFont where 
+module Graphics.SVGFonts.WriteFont where
 
 import Numeric ( showHex )
 
@@ -18,7 +18,7 @@ import qualified Text.Blaze.Svg11.Attributes as A
 import Graphics.SVGFonts.ReadFont
 
 makeSvgFont :: (Show n, S.ToValue n) => PreparedFont n -> Set.Set String -> S.Svg
-makeSvgFont (fd, _) gs =
+makeSvgFont fd gs =
   font ! A.horizAdvX horizAdvX $ do
     -- Font meta information
     S.fontFace ! A.fontFamily fontFamily
@@ -57,18 +57,18 @@ makeSvgFont (fd, _) gs =
     -- Insert the 'missing-glyph'
     case M.lookup ".notdef" (fontDataGlyphs fd) of
       Nothing -> return ()
-      Just (_, _, gPath) -> S.missingGlyph ! A.d (toValue gPath) 
+      Just (_, _, gPath, _) -> S.missingGlyph ! A.d (toValue gPath)
                                            $ return ()
     -- Insert all other glyphs
     forM_ (Set.toList gs') $ \g -> case M.lookup g (fontDataGlyphs fd) of
       Nothing -> return ()
-      Just (gName, gHAdv, gPath) ->
+      Just (gName, gHAdv, gPath, _) ->
         S.glyph ! A.glyphName (toValue gName)
                 ! A.horizAdvX (toValue gHAdv)
-                ! A.d (toValue gPath) 
+                ! A.d (toValue gPath)
                 # maybeUnicode g
                 $ return ()
-    
+
     forM_ (fontDataRawKernings fd) $ \(k, g1, g2, u1, u2) -> do
       let g1' = filter isGlyph g1
           g2' = filter isGlyph g2
@@ -83,56 +83,56 @@ makeSvgFont (fd, _) gs =
                   # maybeString A.u2 (const $ intercalate "," u2')
         False -> return ()
 
-  
+
   where
     (#) :: (B.Attributable h) => h -> Maybe S.Attribute -> h
     (#) x Nothing = x
     (#) x (Just a) = x ! a
-    
+
     unicodeBlacklist :: Set.Set String
-    unicodeBlacklist = Set.fromList 
+    unicodeBlacklist = Set.fromList
       [ ".notdef"
       , ".null"
       ]
-    
+
     maybeUnicode :: String -> Maybe S.Attribute
     maybeUnicode [] = Nothing
     maybeUnicode s | s `Set.member` unicodeBlacklist || length s >= 10 = Nothing
     maybeUnicode s = Just $ A.unicode $ toValue $ concatMap encodeUnicode s
-    
+
     encodeUnicode :: Char -> String
-    encodeUnicode c = 
+    encodeUnicode c =
       let cOrd = ord c
-      in if cOrd >= 32 && cOrd <= 126 
-            then [c] 
+      in if cOrd >= 32 && cOrd <= 126
+            then [c]
             else "&#x" ++ showHex cOrd ""
-    
-    -- maybeMaybe :: (S.ToValue a) 
-    --            => (S.AttributeValue -> S.Attribute) -> (FontData n -> Maybe a) 
+
+    -- maybeMaybe :: (S.ToValue a)
+    --            => (S.AttributeValue -> S.Attribute) -> (FontData n -> Maybe a)
     --            -> Maybe S.Attribute
     maybeMaybe toF fromF = (toF . toValue) `fmap` fromF fd
-    
-    -- maybeString :: (S.AttributeValue -> S.Attribute) -> (FontData n -> String) 
+
+    -- maybeString :: (S.AttributeValue -> S.Attribute) -> (FontData n -> String)
     --             -> Maybe S.Attribute
     maybeString toF fromF = case fromF fd of
       "" -> Nothing
       s -> Just $ toF $ toValue $ s
-    
+
     font :: S.Svg -> S.Svg
     font m = B.Parent (fromString "font") (fromString "<font") (fromString "</font>") m
-    
+
     isGlyph :: String -> Bool
     isGlyph g = g `Set.member` gs'
-    
+
     gs' = Set.insert ".notdef" gs
-    
+
     horizAdvX = toValue $ fontDataHorizontalAdvance fd
     fontFamily = toValue $ fontDataFamily fd
     fontStyle = toValue $ fontDataStyle fd
     fontWeight = toValue $ fontDataWeight fd
     fontStretch = toValue $ fontDataStretch fd
     fontVariant = toValue $ fontDataVariant fd
-    unitsPerEm = toValue $ fontDataUnitsPerEm fd 
+    unitsPerEm = toValue $ fontDataUnitsPerEm fd
     ascent = toValue $ fontDataAscent fd
     descent = toValue $ fontDataDescent fd
     xHeight = toValue $ fontDataXHeight fd
